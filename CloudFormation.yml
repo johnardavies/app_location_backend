@@ -1,0 +1,126 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: API Gateway to trigger a Lambda function that returns the closest location from S3
+
+Resources:
+
+  # S3 Bucket for storing location data
+  LocationsBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub 'locations-bucket-${AWS::AccountId}-${AWS::Region}'
+  
+  # IAM Role for Lambda Function
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: 'LambdaExecutionRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaS3ReadPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${LocationsBucket}/*'
+  
+  # Lambda Function
+  ClosestLocationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'ClosestLocationFunction'
+      Runtime: 'python3.8'  # Change to your preferred runtime
+      Handler: 'lambda_function.lambda_handler'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import math
+
+          s3 = boto3.client('s3')
+          BUCKET_NAME = '${LocationsBucket}'
+
+          def distance(lat1, lon1, lat2, lon2):
+              # Haversine formula to calculate distance
+              R = 6371  # Radius of Earth in kilometers
+              dlat = math.radians(lat2 - lat1)
+              dlon = math.radians(lon2 - lon1)
+              a = (math.sin(dlat / 2) ** 2 +
+                   math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+                   math.sin(dlon / 2) ** 2)
+              c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+              return R * c
+
+          def lambda_handler(event, context):
+              # Get the latitude and longitude from the request
+              lat = float(event['queryStringParameters']['lat'])
+              lon = float(event['queryStringParameters']['lon'])
+
+              # Load locations from S3
+              response = s3.get_object(Bucket=BUCKET_NAME, Key='locations.json')
+              locations = json.loads(response['Body'].read())
+
+              closest_location = None
+              closest_distance = float('inf')
+
+              for location in locations:
+                  loc_lat = location['latitude']
+                  loc_lon = location['longitude']
+                  dist = distance(lat, lon, loc_lat, loc_lon)
+                  if dist < closest_distance:
+                      closest_distance = dist
+                      closest_location = location
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(closest_location)
+              }
+      Role: !GetAtt LambdaExecutionRole.Arn
+  
+  # API Gateway
+  ApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'ClosestLocationApi'
+  
+  # API Resource
+  ApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'closest'
+      RestApiId: !Ref ApiGateway
+  
+  # API Method
+  ApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: 'GET'
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: 'NONE'
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClosestLocationFunction.Arn}/invocations'
+
+  # Lambda Permission to allow API Gateway to invoke Lambda
+  LambdaApiGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ClosestLocationFunction
+      Principal: 'apigateway.amazonaws.com'
+
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL for production stage"
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/closest'
+
