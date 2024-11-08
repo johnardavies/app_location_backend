@@ -1,0 +1,129 @@
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: 'LambdaBasicExecution'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+        # S3 Access Policy for Lambda
+        - PolicyName: 'S3AccessPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 's3:GetObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::listed-buildings-api'
+                  - !Sub 'arn:aws:s3:::your-bucket-name/*'  # Allows access to objects within the bucket
+
+  # API Gateway
+  ApiGateway:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: 'ClosestLocationApi'
+
+  # API Resource
+  ApiResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'closest'
+      RestApiId: !Ref ApiGateway
+
+  # API Method
+  ApiMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      HttpMethod: 'GET'
+      ResourceId: !Ref ApiResource
+      RestApiId: !Ref ApiGateway
+      AuthorizationType: 'NONE'
+      Integration:
+        Type: 'AWS_PROXY'
+        IntegrationHttpMethod: 'POST'
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ClosestLocationFunction.Arn}/invocations'
+
+  # Lambda Permission to allow API Gateway to invoke Lambda
+  LambdaApiGatewayPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref ClosestLocationFunction
+      Principal: 'apigateway.amazonaws.com'
+
+  # API Deployment
+  ApiDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: ApiMethod  # Ensures the deployment happens after the method is created
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: 'prod'  # Sets the deployment stage to prod
+
+  # Lambda Function
+  ClosestLocationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: 'ClosestLocationFunction'
+      Runtime: 'python3.12'  # Change to your preferred runtime
+      Handler: 'index.handler'
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import pandas as pd
+          from io import StringIO
+          from scipy.spatial import cKDTree
+
+          s3 = boto3.client('s3')
+          bucket_name = 'listed-buildings-api'
+          key = 'locations.csv'
+          
+          def lambda_handler(event, context):
+              response = s3.get_object(Bucket=bucket_name, Key=key)
+              csv_content = response['Body'].read().decode('utf-8')
+              new_df = pd.read_csv(StringIO(csv_content))
+
+              # Convert longitude and latitude into a list of tuples
+              points = list(zip(new_df["lon"], new_df["lat"]))
+              tree = cKDTree(points)
+
+              # Input point (longitude, latitude) for which we want the nearest point
+              input_point = (-0.0954023, 51.5609817)
+              distance, index = tree.query(input_point)
+              
+              nearest_point = points[index]
+              nearest_distance = distance
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps({
+                      "name": new_df['Grade'].loc[index],
+                      "grade": new_df['Grade'].loc[index],
+                      "nearest_point": nearest_point,
+                      "distance": nearest_distance
+                  }),
+                  "headers": {
+                      "Content-Type": "application/json"
+                  }
+              }
+
+    
